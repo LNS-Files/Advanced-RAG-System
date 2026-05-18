@@ -1,0 +1,6 @@
+chromadb
+ollama
+pypdf
+sentence-transformers
+streamlit
+tiktoken
