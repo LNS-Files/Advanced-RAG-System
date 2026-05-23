@@ -4,10 +4,17 @@ import logging
 from pathlib import Path
 
 import streamlit as st
+from sentence_transformers import SentenceTransformer
 
-from src.ingestion import extract_text_from_pdf, semantic_chunk_text
-from src.orchestration import generate_answer, retrieve_context
+from src.config import EMBEDDING_MODEL
+from src.ingestion import chunk_pages, extract_pages
+from src.orchestration import retrieve_context, rewrite_query, stream_answer
 from src.vector_store import add_chunks_to_db, initialize_vector_db
+
+
+@st.cache_resource
+def _load_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBEDDING_MODEL)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -47,24 +54,29 @@ def run_ingestion_and_embedding() -> tuple[int, int]:
         raise FileNotFoundError("No PDF files found in the data directory.")
 
     collection = initialize_vector_db()
+    embedding_model = _load_embedding_model()
     processed_files = 0
     stored_chunks = 0
 
     for pdf_path in pdf_files:
-        text = extract_text_from_pdf(pdf_path)
-        if not text.strip():
+        pages = extract_pages(pdf_path)
+        if not pages:
             LOGGER.warning("No extractable text found in %s", pdf_path)
             continue
 
-        chunks = semantic_chunk_text(text)
-        if not chunks:
+        page_chunks = chunk_pages(pages)
+        if not page_chunks:
             LOGGER.warning("No chunks generated for %s", pdf_path)
             continue
 
+        texts = [c["text"] for c in page_chunks]
+        per_chunk_metadata = [{"page": c["page"]} for c in page_chunks]
         stored_ids = add_chunks_to_db(
-            chunks=chunks,
+            chunks=texts,
             collection=collection,
+            embedding_model=embedding_model,
             source=pdf_path.name,
+            per_chunk_metadata=per_chunk_metadata,
         )
         processed_files += 1
         stored_chunks += len(stored_ids)
@@ -102,32 +114,59 @@ def render_sidebar() -> None:
                 LOGGER.exception("Ingestion pipeline failed")
                 st.error(f"Ingestion pipeline failed: {exc}")
 
+        st.divider()
+        if st.button("Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
+
 
 def render_main_screen() -> None:
-    st.subheader("Ask Your Knowledge Base")
-    user_query = st.text_input(
-        "Question",
-        placeholder="Ask a question about the ingested PDFs...",
-    )
+    st.subheader("Chat with Your Knowledge Base")
 
-    if st.button("Generate Answer", type="primary"):
-        if not user_query.strip():
-            st.warning("Enter a question before generating an answer.")
-            return
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-        try:
-            with st.spinner("Retrieving context and generating answer..."):
-                context = retrieve_context(user_query)
-                answer = generate_answer(user_query, context)
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
 
-            st.markdown("### Answer")
-            st.write(answer)
+    if user_query := st.chat_input("Ask a question about the ingested PDFs..."):
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.write(user_query)
+
+        with st.chat_message("assistant"):
+            try:
+                history = st.session_state.messages[:-1]
+                with st.spinner("Rewriting query..."):
+                    search_query = rewrite_query(user_query, history=history)
+                with st.spinner("Retrieving context..."):
+                    context, citations = retrieve_context(search_query)
+                answer = st.write_stream(
+                    stream_answer(user_query, context, history=history)
+                )
+            except Exception as exc:
+                LOGGER.exception("Answer generation failed")
+                answer = f"Answer generation failed: {exc}"
+                context, citations = "", []
+                search_query = user_query
+                st.write(answer)
+
+            if citations:
+                citation_lines = []
+                for c in citations:
+                    label = c["source"]
+                    if c["page"] is not None:
+                        label += f", page {c['page']}"
+                    citation_lines.append(f"- {label}")
+                st.markdown("**Sources:**\n" + "\n".join(citation_lines))
 
             with st.expander("Retrieved Context"):
+                if search_query != user_query:
+                    st.caption(f"Searched for: _{search_query}_")
                 st.write(context or "No relevant context was retrieved.")
-        except Exception as exc:
-            LOGGER.exception("Answer generation failed")
-            st.error(f"Answer generation failed: {exc}")
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 def main() -> None:
