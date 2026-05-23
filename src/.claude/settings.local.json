@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"C:\\\\Users\\\\laxmi\\\\Advanced-RAG-System\" add app.py src/ingestion.py src/orchestration.py src/vector_store.py src/__init__.py src/config.py)",
+      "Bash(git -C 'C:\\\\Users\\\\laxmi\\\\Advanced-RAG-System' commit -m ' *)"
+    ]
+  }
+}
